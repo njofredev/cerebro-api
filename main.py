@@ -5,6 +5,8 @@ from psycopg2.extras import RealDictCursor
 import os
 from typing import List
 import uvicorn
+import json
+from datetime import datetime
 
 app = FastAPI(title="Cerebro API - Policlínico Tabancura")
 
@@ -19,55 +21,61 @@ class OrdenMedicaIn(BaseModel):
     folio: str
     rut: str
 
-# --- LÓGICA DE CONEXIÓN (IDÉNTICA A TU COTIZADOR) ---
+class ItemActualizacion(BaseModel):
+    # Mapeo directo de las columnas del data_editor de Streamlit
+    codigo_ingreso: str
+    nombre_prestacion: str
+    copago: int
+
+class ActualizarCotizacionIn(BaseModel):
+    folio: str
+    items: List[dict]
+
+class AuditoriaOrdenIn(BaseModel):
+    rut_paciente: str
+    nombre_paciente: str
+    folio_origen: str
+    cantidad_examenes: int
+    codigos: List[str]
+
+# --- LÓGICA DE CONEXIÓN ---
 
 def conectar_db():
-    # Intenta obtener de variables de entorno (Coolify/Docker)
     host = os.getenv("POSTGRES_HOST")
     if host:
         database = os.getenv("POSTGRES_DATABASE")
         user = os.getenv("POSTGRES_USER")
         password = os.getenv("POSTGRES_PASSWORD")
         port = os.getenv("POSTGRES_PORT")
-    else:
-        # Nota: FastAPI no accede a st.secrets de Streamlit. 
-        # Asegúrate de configurar las Variables de Entorno en Coolify.
-        return None
-
-    try:
-        conn = psycopg2.connect(
-            host=host,
-            database=database,
-            user=user,
-            password=password,
-            port=port,
-            sslmode="disable" # Mantenemos tu config de seguridad
-        )
-        return conn
-    except Exception as e:
-        print(f"Error crítico de conexión a DB: {e}")
-        return None
+        try:
+            conn = psycopg2.connect(
+                host=host,
+                database=database,
+                user=user,
+                password=password,
+                port=port,
+                sslmode="disable"
+            )
+            return conn
+        except Exception as e:
+            print(f"Error de conexión: {e}")
+            return None
+    return None
 
 # --- ENDPOINTS ---
 
 @app.get("/cotizaciones/buscar/{rut}")
 def buscar_cotizaciones_por_rut(rut: str):
-    """Busca cotizaciones usando el documento_id del paciente"""
     conn = conectar_db()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Error de conexión a DB")
-    
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        # Buscamos por documento_id (RUT con puntos y guion)
         query = "SELECT * FROM cotizaciones WHERE documento_id = %s ORDER BY fecha_cotizacion DESC"
         cur.execute(query, (rut,))
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        
-        if not rows:
-            raise HTTPException(status_code=404, detail="No se encontraron cotizaciones para este RUT")
+        if not rows: raise HTTPException(status_code=404, detail="No se encontraron cotizaciones")
         return rows
     except Exception as e:
         if conn: conn.close()
@@ -75,13 +83,11 @@ def buscar_cotizaciones_por_rut(rut: str):
 
 @app.get("/cotizaciones/detalle/{folio}", response_model=List[DetalleBase])
 def obtener_detalle_cotizacion(folio: str):
-    """Trae los exámenes asociados a un folio específico"""
     conn = conectar_db()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Error de conexión a DB")
-    
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
+        # Sincronizado con nombres de columnas de imagen_02a7c0.png
         query = "SELECT codigo_examen, nombre_examen, valor_copago FROM detalle_cotizaciones WHERE folio_cotizacion = %s"
         cur.execute(query, (folio,))
         rows = cur.fetchall()
@@ -92,28 +98,75 @@ def obtener_detalle_cotizacion(folio: str):
         if conn: conn.close()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/ordenes/generar")
-def generar_orden_medica(orden: OrdenMedicaIn):
-    """Registra la conversión de una cotización en una orden médica"""
+@app.post("/cotizaciones/actualizar")
+def actualizar_cotizacion(data: ActualizarCotizacionIn):
+    """Actualiza los exámenes de una cotización tras ser editados en el portal"""
     conn = conectar_db()
-    if not conn:
-        raise HTTPException(status_code=500, detail="Error de conexión a DB")
-    
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
     try:
         cur = conn.cursor()
-        # Insertamos en la nueva tabla de trazabilidad
+        # 1. Eliminar detalle previo según folio_cotizacion
+        cur.execute("DELETE FROM detalle_cotizaciones WHERE folio_cotizacion = %s", (data.folio,))
+        
+        # 2. Insertar nuevos items editados
+        for item in data.items:
+            cur.execute("""
+                INSERT INTO detalle_cotizaciones (folio_cotizacion, codigo_examen, nombre_examen, valor_copago)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                data.folio, 
+                str(item.get('Codigo Ingreso', '')), 
+                item.get('Nombre prestación en Fonasa o Particular', ''),
+                int(item.get('Copago', 0))
+            ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "success", "message": f"Detalle del folio {data.folio} actualizado"}
+    except Exception as e:
+        if conn: conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auditoria/ordenes")
+def registrar_auditoria(audit: AuditoriaOrdenIn):
+    """Registra auditoría detallada de la generación de órdenes"""
+    conn = conectar_db()
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
+    try:
+        cur = conn.cursor()
+        # Insertar en la tabla de auditoría (debe ser creada previamente)
         query = """
-            INSERT INTO ordenes_medicas (folio_cotizacion, rut_paciente) 
-            VALUES (%s, %s)
+            INSERT INTO auditoria_examenes 
+            (rut_paciente, nombre_paciente, folio_origen, cantidad_examenes, codigos_json)
+            VALUES (%s, %s, %s, %s, %s)
         """
+        cur.execute(query, (
+            audit.rut_paciente,
+            audit.nombre_paciente,
+            audit.folio_origen,
+            audit.cantidad_examenes,
+            json.dumps(audit.codigos)
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "success", "message": "Auditoría registrada"}
+    except Exception as e:
+        if conn: conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ordenes/generar")
+def generar_orden_medica(orden: OrdenMedicaIn):
+    conn = conectar_db()
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
+    try:
+        cur = conn.cursor()
+        query = "INSERT INTO ordenes_medicas (folio_cotizacion, rut_paciente) VALUES (%s, %s)"
         cur.execute(query, (orden.folio, orden.rut))
         conn.commit()
         cur.close()
         conn.close()
-        return {"status": "success", "message": f"Orden vinculada exitosamente al folio {orden.folio}"}
-    except psycopg2.errors.UniqueViolation:
-        if conn: conn.close()
-        raise HTTPException(status_code=400, detail="Esta cotización ya fue convertida en una orden previamente.")
+        return {"status": "success", "message": f"Orden vinculada al folio {orden.folio}"}
     except Exception as e:
         if conn: conn.close()
         raise HTTPException(status_code=500, detail=str(e))
