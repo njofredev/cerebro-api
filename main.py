@@ -170,6 +170,24 @@ def generar_orden_medica(orden: OrdenMedicaIn):
     except Exception as e:
         if conn: conn.close()
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/auditoria/historial")
+def obtener_historial_auditoria():
+    """Consulta todos los registros de la tabla de auditoría"""
+    conn = conectar_db()
+    if not conn: raise HTTPException(status_code=500, detail="Error de conexión a DB")
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        # Ordenamos por los más recientes primero
+        query = "SELECT * FROM auditoria_examenes ORDER BY fecha_emision DESC"
+        cur.execute(query)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return rows
+    except Exception as e:
+        if conn: conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
